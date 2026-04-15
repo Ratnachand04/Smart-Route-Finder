@@ -18,7 +18,7 @@
 This project is a hybrid routing engine over a world map and a 3D globe.
 
 Current runtime behavior:
-- Route tab: real-road calibration via Nominatim geocoding + OSRM driving route.
+- Route tab: selected algorithm (Dijkstra/A*/BFS/DFS) runs on density-weighted hex mesh after source/destination geocoding.
 - Compare and Multi-Route tabs: synthetic hex-mesh routing using Dijkstra, A*, BFS, DFS.
 - Traffic and mesh controls: deterministic per-cell density simulation.
 - 3D globe: Cesium rendering of the same mesh core with automatic fallback to 2D if 3D fails.
@@ -111,7 +111,7 @@ where $p_v$ is dynamic penalty used for alternative routes.
 
 ## 2) Algorithms and Working Method
 
-Note: these algorithms power the synthetic hex mesh workflows (Compare, Multi-Route, Traffic analysis). The Route tab uses live OSRM road routing after geocoding user inputs.
+Note: all routing workflows (Route, Compare, Multi-Route, Traffic analysis) run on the synthetic hex-density mesh. Location text is geocoded with Nominatim when available, with deterministic fallback when unavailable.
 
 | Algorithm | Objective | Score/Rule | Working Method in This Model |
 |---|---|---|---|
@@ -137,6 +137,87 @@ $$
 - BFS uses queue expansion with low-density ordering for tie preference.
 - DFS uses stack expansion with low-density ordering for branch preference.
 
+### 2.1 Project Search Lifecycle (DSA View)
+
+```mermaid
+flowchart LR
+    U["User provides source and destination"] --> M["Build or refresh visible hex mesh graph"]
+    M --> A["Choose algorithm: Dijkstra / A* / BFS / DFS"]
+    A --> F["Initialize frontier and parent map"]
+    F --> E["Expand next node and evaluate neighbors"]
+    E --> C{"Goal reached?"}
+    C -- "No" --> F
+    C -- "Yes" --> P["Reconstruct path from parent links"]
+    P --> R["Render route in 2D and 3D"]
+```
+
+### 2.2 Four Distinct Algorithm Graphs
+
+#### Dijkstra (Weighted Shortest Path)
+
+```mermaid
+flowchart TD
+    S["Start at source hex"] --> Q["Priority queue ordered by g cost"]
+    Q --> U["Pop node with minimum g"]
+    U --> G{"Goal reached?"}
+    G -- "Yes" --> X["Backtrack parent links and return shortest weighted path"]
+    G -- "No" --> N["For each neighbor compute g_new"]
+    N --> R{"g_new < g_old?"}
+    R -- "Yes" --> UP["Update g, update parent, push to queue"]
+    R -- "No" --> SK["Skip neighbor"]
+    UP --> Q
+    SK --> Q
+```
+
+#### A* (Weighted + Heuristic)
+
+```mermaid
+flowchart TD
+    S["Start at source hex"] --> I["Initialize g(source)=0 and f=g+h"]
+    I --> O["Open set ordered by f"]
+    O --> U["Pop node with minimum f"]
+    U --> G{"Goal reached?"}
+    G -- "Yes" --> X["Backtrack parent links and return path"]
+    G -- "No" --> N["For each neighbor compute tentative g"]
+    N --> H["Compute heuristic h as haversine to goal"]
+    H --> F["Set f = g + h and update open set"]
+    F --> O
+```
+
+#### BFS (Minimum Hops, FIFO)
+
+```mermaid
+flowchart TD
+    S["Start at source hex"] --> Q["Queue frontier (FIFO)"]
+    Q --> D["Dequeue current node"]
+    D --> G{"Goal reached?"}
+    G -- "Yes" --> X["Backtrack parent links and return minimum-hop path"]
+    G -- "No" --> V["Visit unvisited neighbors in density-prioritized order"]
+    V --> E["Mark visited, set parent, enqueue"]
+    E --> Q
+```
+
+#### DFS (Depth-First, LIFO)
+
+```mermaid
+flowchart TD
+    S["Start at source hex"] --> ST["Stack frontier (LIFO)"]
+    ST --> P["Pop top node"]
+    P --> G{"Goal reached?"}
+    G -- "Yes" --> X["Backtrack parent links and return discovered path"]
+    G -- "No" --> V["Push unvisited neighbors in density-prioritized order"]
+    V --> ST
+```
+
+### 2.3 Frontier Behavior (At a Glance)
+
+| Algorithm | Frontier Data Structure | Next Node Selection | Ordering Key |
+|---|---|---|---|
+| Dijkstra | Priority queue | Pop minimum priority element | Lowest cumulative cost $g$ |
+| A* | Open set (priority queue) | Pop minimum priority element | Lowest estimated total $f = g + h$ |
+| BFS (BFT) | Queue | Dequeue front (FIFO) | Insertion order by breadth level |
+| DFS (DFT) | Stack | Pop top (LIFO) | Most recently pushed branch |
+
 ---
 
 ## 3) Color System Used in Architecture and Math Narrative
@@ -158,10 +239,8 @@ $$
 flowchart LR
     U["User Inputs<br/>Source / Destination / Algorithm / Seed / Refinement"] --> FE["Frontend Controller<br/>app.js"]
 
-    FE --> NOM["Nominatim<br/>Geocoding"]
-    FE --> OSRM["OSRM<br/>Driving Route"]
-    OSRM --> R2D["Leaflet 2D Renderer"]
-    OSRM --> R3D["Cesium 3D Renderer<br/>Route Arc"]
+    FE --> NOM["Nominatim<br/>Geocoding (best effort)"]
+    NOM --> FE
 
     FE --> MESH["Hex Mesh Builder<br/>Global Row/Col Window"]
     FE --> API["Flask API<br/>app.py"]
@@ -187,7 +266,7 @@ flowchart LR
     classDef state fill:#f3f4f6,stroke:#374151,stroke-width:2,color:#111827
 
     class FE,MESH frontend
-    class NOM,OSRM api
+    class NOM api
     class API,CFG,DEN,HIST api
     class ENGINE,SIM,CELLS sim
     class SEARCH,ROUTE algo
@@ -205,31 +284,24 @@ sequenceDiagram
     participant FE as Frontend Engine
     participant API as Flask API
     participant NOM as Nominatim
-    participant OSRM as OSRM
     participant SIM as Density Simulator
     participant ALG as Search Core
     participant V2D as Leaflet 2D
     participant V3D as Cesium 3D
 
     UI->>FE: enter source and destination
-    FE->>NOM: geocode input text
+    FE->>NOM: geocode input text (best effort)
     NOM-->>FE: coordinates
+    Note over FE: If geocoding fails, deterministic synthetic fallback is used
 
-    alt Route tab (real road mode)
-        FE->>OSRM: request driving route
-        OSRM-->>FE: geometry + distance + duration
-        FE->>V2D: draw calibrated road route
-        FE->>V3D: draw globe route arc
-    else Compare/Multi/Traffic (hex mesh mode)
-        FE->>API: POST /api/mesh/config
-        FE->>API: POST /api/mesh/density(cells, zoom, edge_m)
-        API->>SIM: compute deterministic densities
-        SIM-->>FE: density map
-        FE->>ALG: run selected algorithm on hex graph
-        ALG-->>FE: pathIds + weighted metrics
-        FE->>V2D: draw mesh route and metrics
-        FE->>V3D: draw mesh + route overlays
-    end
+    FE->>API: POST /api/mesh/config
+    FE->>API: POST /api/mesh/density(cells, zoom, edge_m)
+    API->>SIM: compute deterministic densities
+    SIM-->>FE: density map
+    FE->>ALG: run selected algorithm on hex graph
+    ALG-->>FE: pathIds + weighted metrics
+    FE->>V2D: draw mesh route and metrics
+    FE->>V3D: draw mesh + route overlays
 
     V3D->>V3D: adaptive LOD refresh
 ```
@@ -340,7 +412,7 @@ http://127.0.0.1:5000
 ```
 
 Presentation flow:
-- Route tab: enter source/destination and show calibrated real driving route.
+- Route tab: enter source/destination and run selected hex-density routing algorithm.
 - Compare/Multi tabs: show hex-mesh algorithm behavior (Dijkstra/A*/BFS/DFS).
 - Traffic tab: demonstrate density and height coupling per hex.
 - 3D: show stationary India-focused globe mesh with adaptive LOD and automatic 2D fallback on 3D failure.
