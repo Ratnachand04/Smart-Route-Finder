@@ -4,10 +4,14 @@ Serves graph data and route computations to the frontend.
 Run: python app.py
 """
 
-from flask import Flask, jsonify, request, send_file
+from pathlib import Path
+
+from flask import Flask, jsonify, request, send_file, Response
 from graph_engine import SmartRouter
 
 app = Flask(__name__)
+app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
+BASE_DIR = Path(__file__).resolve().parent
 
 # Try to enable CORS, but continue without it if flask_cors is not installed
 try:
@@ -17,6 +21,15 @@ except ImportError:
     print("Warning: flask_cors not installed. CORS disabled.")
 
 router = SmartRouter()
+
+
+def _serve_file(filename: str, mimetype: str | None = None):
+    """Serve local project files with no-cache headers to avoid stale UI assets."""
+    response = send_file(BASE_DIR / filename, mimetype=mimetype, max_age=0, conditional=False)
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 # ── Graph Data ─────────────────────────────────────
 
@@ -126,17 +139,23 @@ def clear_history():
 
 @app.route("/")
 def index():
-    return send_file("index.html")
+    return _serve_file("index.html", mimetype="text/html; charset=utf-8")
 
 
 @app.route("/styles.css")
 def styles():
-    return send_file("styles.css")
+    return _serve_file("styles.css", mimetype="text/css; charset=utf-8")
 
 
 @app.route("/app.js")
 def script_app():
-    return send_file("app.js")
+    return _serve_file("app.js", mimetype="application/javascript; charset=utf-8")
+
+
+@app.route("/favicon.ico")
+def favicon():
+    # Avoid noisy browser 404s when requesting a default site icon.
+    return Response(status=204)
 
 if __name__ == "__main__":
     print("Smart Route Finder API running at http://localhost:5000")

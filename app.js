@@ -2,14 +2,11 @@
 // CONFIGURATION
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 const API = 'http://localhost:5000/api';
+const NOMINATIM_API = 'https://nominatim.openstreetmap.org';
 
 // â”€â”€ STATE â”€â”€
-let graphData = null;
-let currentPath = [];
-let visitedNodes = [];
 let selectedAlgo = 'dijkstra';
 let selectedMultiRouteIdx = 0;
-let multiRoutes = [];
 let meshTrafficIntensity = 0.35;
 let meshSeed = 424242;
 let meshPatternMode = 'radial';
@@ -20,6 +17,9 @@ let hexCellById = new Map();
 let hexLayer;
 let activeHexRoute = [];
 let meshRenderVersion = 0;
+let meshRefreshTimer = null;
+let meshViewportKey = '';
+let hexCanvasRenderer = null;
 
 // â”€â”€ MAP â”€â”€
 let map;
@@ -36,6 +36,8 @@ let globeRouteDataSource = null;
 let globeMeshDataSource = null;
 let globeMeshRefreshTimer = null;
 let globeMeshLodKey = '';
+let globeFallbackLock = false;
+let globeGuardsBound = false;
 const INDIA_FOCUS = {
   lon: 78.9629,
   lat: 22.5937,
@@ -49,6 +51,30 @@ const HEX_EDGE_MIN_METERS = 50;
 const HEX_EDGE_MAX_METERS = 100;
 const HEX_GEO_HEIGHT_MIN_METERS = 50;
 const HEX_GEO_HEIGHT_MAX_METERS = 100;
+const HEX_INTERACTION_DEBOUNCE_MS = 140;
+
+const DEVICE_MEMORY_GB = (typeof navigator !== 'undefined' && typeof navigator.deviceMemory === 'number')
+  ? navigator.deviceMemory
+  : 4;
+
+const GPU_ACCEL_AVAILABLE = (() => {
+  try {
+    const canvas = document.createElement('canvas');
+    return Boolean(canvas.getContext('webgl2') || canvas.getContext('webgl'));
+  } catch (_) {
+    return false;
+  }
+})();
+
+const HIGH_VRAM_HINT = GPU_ACCEL_AVAILABLE && DEVICE_MEMORY_GB >= 8;
+const HEX_CELL_BUDGET_2D = HIGH_VRAM_HINT ? 6500 : 4500;
+const HEX_CELL_BUDGET_3D = HIGH_VRAM_HINT ? 2800 : 1800;
+const HEX_DENSITY_FETCH_BATCH = HIGH_VRAM_HINT ? 1800 : 1200;
+const HEX_RENDER_CHUNK_CPU = 120;
+const HEX_RENDER_CHUNK_GPU = HIGH_VRAM_HINT ? 420 : 260;
+const DEFAULT_VIEW_MODE = '2d';
+const GLOBE_ROUTE_MAX_POINTS = 260;
+const GLOBE_MESH_REFRESH_DEBOUNCE_MS = 220;
 
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // INIT
@@ -56,8 +82,16 @@ const HEX_GEO_HEIGHT_MAX_METERS = 100;
 window.addEventListener('DOMContentLoaded', async () => {
   await loadMeshConfigFromServer();
   initMap();
-  await loadGraphFromServer();
-  enable3DFirstView();
+  setAlgo(selectedAlgo);
+  bindGlobeRuntimeGuards();
+  if (DEFAULT_VIEW_MODE === '3d') {
+    const started3D = enable3DFirstView();
+    if (!started3D) {
+      showToast('3D startup failed. Running in 2D fallback mode.', 'warn');
+    }
+  } else {
+    showToast('2D default mode enabled for stable submission. Use 3D button if needed.', 'info');
+  }
 });
 
 async function loadMeshConfigFromServer() {
@@ -117,34 +151,133 @@ async function persistMeshConfig(extra = {}) {
   syncSyntheticControlFields();
 }
 
-async function loadGraphFromServer() {
-  try {
-    const res = await fetch(`${API}/graph`);
-    graphData = await res.json();
-    updateMapLayer();
-    // Wait for markers to be created then fit bounds
-    setTimeout(resetView, 100);
-  } catch(e) {
-    showToast('Could not load graph from server. Using local demo data.', 'error');
-    graphData = getDemoGraph();
-    updateMapLayer();
+function resetHexMeshViewportKey() {
+  meshViewportKey = '';
+}
+
+function getHexMeshViewportKey(boundsObj, zoom) {
+  return [
+    zoom.toFixed(2),
+    boundsObj.getSouth().toFixed(4),
+    boundsObj.getWest().toFixed(4),
+    boundsObj.getNorth().toFixed(4),
+    boundsObj.getEast().toFixed(4),
+    meshResolutionFactor.toFixed(3),
+    meshTrafficIntensity.toFixed(3),
+    meshPatternMode,
+    globeMode ? 'g1' : 'g0'
+  ].join('|');
+}
+
+function queueHexMeshRefresh(reason = 'interaction', { immediate = false, force = false } = {}) {
+  if (!map || !hexLayer) return;
+
+  if (meshRefreshTimer) {
+    clearTimeout(meshRefreshTimer);
   }
+
+  const delayMs = immediate ? 0 : HEX_INTERACTION_DEBOUNCE_MS;
+  meshRefreshTimer = setTimeout(() => {
+    meshRefreshTimer = null;
+    refreshHexMesh({ force, reason }).catch(() => {
+      // Keep UI responsive even if a refresh cycle fails.
+    });
+  }, delayMs);
+}
+
+function nextFrame() {
+  return new Promise(resolve => {
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(() => resolve());
+      return;
+    }
+    setTimeout(resolve, 0);
+  });
+}
+
+function getHexRenderChunkSize() {
+  return GPU_ACCEL_AVAILABLE ? HEX_RENDER_CHUNK_GPU : HEX_RENDER_CHUNK_CPU;
+}
+
+function isGlobeErrorPayload(payload) {
+  const msg = String(payload || '').toLowerCase();
+  return msg.includes('cesium') ||
+    msg.includes('webgl') ||
+    msg.includes('context') ||
+    msg.includes('globe') ||
+    msg.includes('terrain') ||
+    msg.includes('imagery');
+}
+
+function switchTo2DFallback(reason) {
+  const canvasArea = document.querySelector('.canvas-area');
+  const mapDiv = document.getElementById('map');
+  const globeDiv = document.getElementById('globe3d');
+  const globeBtn = document.getElementById('globe-btn');
+
+  globeMode = false;
+  if (globeDiv) globeDiv.style.display = 'none';
+  if (mapDiv) mapDiv.style.display = 'block';
+  if (canvasArea) canvasArea.classList.remove('globe-mode');
+  if (globeBtn) globeBtn.textContent = '3D';
+  setStationaryGlobeControlState(false);
+
+  if (map) {
+    map.invalidateSize();
+    resetView();
+  }
+  resetHexMeshViewportKey();
+  queueHexMeshRefresh('3d-fallback', { immediate: true, force: true });
+  showToast(`3D unavailable (${reason}). Switched to 2D.`, 'warn');
+}
+
+function handleGlobeFailure(reason, error) {
+  if (error) {
+    console.error(`[3D Globe] ${reason}`, error);
+  }
+
+  if (globeFallbackLock) return;
+  globeFallbackLock = true;
+  switchTo2DFallback(reason);
+
+  setTimeout(() => {
+    globeFallbackLock = false;
+  }, 400);
+}
+
+function bindGlobeRuntimeGuards() {
+  if (globeGuardsBound) return;
+  globeGuardsBound = true;
+
+  window.addEventListener('error', event => {
+    if (!globeMode) return;
+    const msg = `${event?.message || ''} ${event?.filename || ''}`;
+    if (isGlobeErrorPayload(msg)) {
+      handleGlobeFailure('runtime error', event?.error || event);
+    }
+  });
+
+  window.addEventListener('unhandledrejection', event => {
+    if (!globeMode) return;
+    const msg = String(event?.reason?.message || event?.reason || '');
+    if (isGlobeErrorPayload(msg)) {
+      handleGlobeFailure('runtime rejection', event?.reason);
+    }
+  });
 }
 
 function initMap() {
-  map = L.map('map', { zoomControl: false }).setView([20, 0], 2);
+  map = L.map('map', {
+    zoomControl: false,
+    preferCanvas: true,
+    worldCopyJump: true
+  }).setView([20, 0], 2);
   const onlineTiles = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
     attribution: '&copy; OpenStreetMap contributors',
-    maxZoom: 20,
-    noWrap: true,
-    bounds: [[-85, -180], [85, 180]]
+    maxZoom: 20
   }).addTo(map);
 
-  const offlineGrid = L.gridLayer({
-    noWrap: true,
-    bounds: [[-85, -180], [85, 180]],
-    attribution: 'Offline grid layer'
-  });
+  const offlineGrid = L.gridLayer({ attribution: 'Offline grid layer' });
 
   offlineGrid.createTile = function(coords) {
     const tile = document.createElement('canvas');
@@ -171,91 +304,129 @@ function initMap() {
     }
   });
 
-  map.setMaxBounds([[-85, -180], [85, 180]]);
-  map.options.maxBoundsViscosity = 1.0;
-
+  hexCanvasRenderer = L.canvas({ padding: 0.12 });
   hexLayer = L.layerGroup().addTo(map);
-  refreshHexMesh();
-  map.on('zoomend moveend', () => {
-    refreshHexMesh();
+  queueHexMeshRefresh('initial-load', { immediate: true, force: true });
+
+  map.on('movestart zoomstart', () => {
+    meshRenderVersion += 1;
   });
+
+  map.on('zoomend moveend resize', () => {
+    queueHexMeshRefresh('viewport-change');
+  });
+
+  setTimeout(() => {
+    map.invalidateSize();
+    queueHexMeshRefresh('post-layout', { immediate: true });
+  }, 0);
 }
 
 function initGlobeViewer() {
-  if (globeViewer || typeof Cesium === 'undefined') return;
+  if (globeViewer) return true;
+  if (typeof Cesium === 'undefined') return false;
 
-  globeViewer = new Cesium.Viewer('globe3d', {
-    imageryProvider: new Cesium.UrlTemplateImageryProvider({
-      url: 'https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-      credit: 'Esri World Imagery'
-    }),
-    terrainProvider: new Cesium.EllipsoidTerrainProvider(),
-    baseLayerPicker: false,
-    geocoder: false,
-    homeButton: false,
-    timeline: false,
-    animation: false,
-    sceneModePicker: false,
-    navigationHelpButton: false,
-    fullscreenButton: false,
-    infoBox: false,
-    selectionIndicator: false,
-    shouldAnimate: true
-  });
+  try {
+    globeViewer = new Cesium.Viewer('globe3d', {
+      imageryProvider: new Cesium.UrlTemplateImageryProvider({
+        url: 'https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+        credit: 'Esri World Imagery'
+      }),
+      terrainProvider: new Cesium.EllipsoidTerrainProvider(),
+      baseLayerPicker: false,
+      geocoder: false,
+      homeButton: false,
+      timeline: false,
+      animation: false,
+      sceneModePicker: false,
+      navigationHelpButton: false,
+      fullscreenButton: false,
+      infoBox: false,
+      selectionIndicator: false,
+      shouldAnimate: true,
+      requestRenderMode: true,
+      maximumRenderTimeChange: Infinity,
+      scene3DOnly: true
+    });
 
-  globeViewer.scene.globe.enableLighting = true;
-  globeViewer.scene.globe.showGroundAtmosphere = true;
-  globeViewer.scene.skyAtmosphere.show = true;
-  globeViewer.scene.moon.show = true;
-  globeViewer.scene.backgroundColor = Cesium.Color.BLACK;
-  globeViewer.scene.globe.baseColor = Cesium.Color.BLACK;
+    globeViewer.resolutionScale = HIGH_VRAM_HINT ? 0.9 : 0.7;
 
-  globeViewer.scene.globe.atmosphereHueShift = 0.0;
-  globeViewer.scene.globe.atmosphereSaturationShift = 0.08;
-  globeViewer.scene.globe.atmosphereBrightnessShift = -0.03;
+    globeViewer.scene.globe.enableLighting = true;
+    globeViewer.scene.globe.showGroundAtmosphere = true;
+    globeViewer.scene.skyAtmosphere.show = true;
+    globeViewer.scene.moon.show = true;
+    globeViewer.scene.backgroundColor = Cesium.Color.BLACK;
+    globeViewer.scene.globe.baseColor = Cesium.Color.BLACK;
 
-  globeViewer.clock.multiplier = 1200;
-  globeViewer.clock.shouldAnimate = true;
+    globeViewer.scene.globe.atmosphereHueShift = 0.0;
+    globeViewer.scene.globe.atmosphereSaturationShift = 0.08;
+    globeViewer.scene.globe.atmosphereBrightnessShift = -0.03;
 
-  globeViewer.scene.fxaa = true;
-  globeViewer.scene.postProcessStages.fxaa.enabled = true;
+    globeViewer.clock.multiplier = 1200;
+    globeViewer.clock.shouldAnimate = true;
 
-  const bloom = globeViewer.scene.postProcessStages.bloom;
-  bloom.enabled = true;
-  bloom.uniforms.glowOnly = false;
-  bloom.uniforms.contrast = 128;
-  bloom.uniforms.brightness = -0.2;
-  bloom.uniforms.delta = 1.0;
-  bloom.uniforms.sigma = 2.2;
-  bloom.uniforms.stepSize = 1.0;
+    globeViewer.scene.fxaa = true;
+    globeViewer.scene.postProcessStages.fxaa.enabled = true;
 
-  globeTickHandler = function() {
-    if (!globeAutoRotate) return;
-    globeViewer.scene.camera.rotate(Cesium.Cartesian3.UNIT_Z, -0.00035);
-  };
-  globeViewer.clock.onTick.addEventListener(globeTickHandler);
+    const bloom = globeViewer.scene.postProcessStages.bloom;
+    bloom.enabled = HIGH_VRAM_HINT;
+    bloom.uniforms.glowOnly = false;
+    bloom.uniforms.contrast = 128;
+    bloom.uniforms.brightness = -0.2;
+    bloom.uniforms.delta = 1.0;
+    bloom.uniforms.sigma = 2.2;
+    bloom.uniforms.stepSize = 1.0;
 
-  const ctrl = globeViewer.scene.screenSpaceCameraController;
-  ctrl.enableRotate = false;
-  ctrl.enableTranslate = false;
-  ctrl.enableZoom = false;
-  ctrl.enableTilt = false;
-  ctrl.enableLook = false;
-  ctrl.inertiaSpin = 0;
-  ctrl.inertiaTranslate = 0;
-  ctrl.inertiaZoom = 0;
+    globeTickHandler = function() {
+      if (!globeAutoRotate) return;
+      globeViewer.scene.camera.rotate(Cesium.Cartesian3.UNIT_Z, -0.00035);
+    };
+    globeViewer.clock.onTick.addEventListener(globeTickHandler);
 
-  globeRouteDataSource = new Cesium.CustomDataSource('route-overlay');
-  globeMeshDataSource = new Cesium.CustomDataSource('hex-mesh-overlay');
-  globeViewer.dataSources.add(globeMeshDataSource);
-  globeViewer.dataSources.add(globeRouteDataSource);
+    const ctrl = globeViewer.scene.screenSpaceCameraController;
+    ctrl.enableRotate = false;
+    ctrl.enableTranslate = false;
+    ctrl.enableZoom = false;
+    ctrl.enableTilt = false;
+    ctrl.enableLook = false;
+    ctrl.inertiaSpin = 0;
+    ctrl.inertiaTranslate = 0;
+    ctrl.inertiaZoom = 0;
 
-  setGlobeIndiaStationaryView();
+    const canvas = globeViewer.scene?.canvas;
+    if (canvas) {
+      canvas.addEventListener('webglcontextlost', event => {
+        event.preventDefault();
+        handleGlobeFailure('webgl context lost', event);
+      }, { passive: false });
+    }
 
-  globeViewer.camera.percentageChanged = 0.02;
-  globeViewer.camera.changed.addEventListener(() => {
-    scheduleGlobeMeshRefresh();
-  });
+    globeRouteDataSource = new Cesium.CustomDataSource('route-overlay');
+    globeMeshDataSource = new Cesium.CustomDataSource('hex-mesh-overlay');
+    globeViewer.dataSources.add(globeMeshDataSource);
+    globeViewer.dataSources.add(globeRouteDataSource);
+
+    setGlobeIndiaStationaryView();
+
+    globeViewer.camera.percentageChanged = 0.05;
+    globeViewer.camera.changed.addEventListener(() => {
+      scheduleGlobeMeshRefresh();
+    });
+
+    window.addEventListener('resize', () => {
+      if (!globeViewer) return;
+      globeViewer.resize();
+      globeViewer.scene.requestRender();
+    });
+
+    return true;
+  } catch (error) {
+    handleGlobeFailure('viewer initialization failed', error);
+    globeViewer = null;
+    globeRouteDataSource = null;
+    globeMeshDataSource = null;
+    return false;
+  }
 }
 
 function setGlobeIndiaStationaryView() {
@@ -289,97 +460,125 @@ function setStationaryGlobeControlState(isLocked3D) {
 }
 
 function enable3DFirstView() {
-  if (!globeMode) {
+  if (globeMode) return true;
+
+  try {
     toggleGlobeMode();
-    showToast('3D globe mode enabled', 'success');
+    if (globeMode) {
+      showToast('3D globe mode enabled', 'success');
+      return true;
+    }
+  } catch (error) {
+    handleGlobeFailure('startup initialization failed', error);
   }
+
+  return false;
 }
 
 function renderGlobeRoute() {
   if (!globeViewer || !globeRouteDataSource) return;
 
-  const routeEntities = globeRouteDataSource.entities;
-  routeEntities.removeAll();
+  try {
+    const routeEntities = globeRouteDataSource.entities;
+    routeEntities.removeAll();
 
-  if (!latestRouteCoords.length) {
+    if (!latestRouteCoords.length) {
+      setGlobeIndiaStationaryView();
+      return;
+    }
+
+    let sampledCoords = latestRouteCoords;
+    if (sampledCoords.length > GLOBE_ROUTE_MAX_POINTS) {
+      const stride = Math.ceil(sampledCoords.length / GLOBE_ROUTE_MAX_POINTS);
+      const reduced = [];
+      for (let i = 0; i < sampledCoords.length; i += stride) {
+        reduced.push(sampledCoords[i]);
+      }
+      const last = sampledCoords[sampledCoords.length - 1];
+      const tail = reduced[reduced.length - 1];
+      if (!tail || tail[0] !== last[0] || tail[1] !== last[1]) {
+        reduced.push(last);
+      }
+      sampledCoords = reduced;
+    }
+
+    const polylinePositions = sampledCoords.map(c => Cesium.Cartesian3.fromDegrees(c[1], c[0], 12000));
+
+    const arcDegrees = [];
+    const arcPeak = 90000;
+    const arcBase = 14000;
+    const maxIndex = Math.max(1, sampledCoords.length - 1);
+    for (let i = 0; i < sampledCoords.length; i++) {
+      const ratio = i / maxIndex;
+      const arcHeight = arcBase + Math.sin(ratio * Math.PI) * arcPeak;
+      arcDegrees.push(sampledCoords[i][1], sampledCoords[i][0], arcHeight);
+    }
+
+    routeEntities.add({
+      polyline: {
+        positions: Cesium.Cartesian3.fromDegreesArrayHeights(arcDegrees),
+        width: 4,
+        material: new Cesium.PolylineGlowMaterialProperty({
+          glowPower: 0.14,
+          taperPower: 0.5,
+          color: Cesium.Color.fromCssColorString('#52c7ff')
+        })
+      }
+    });
+
+    routeEntities.add({
+      polyline: {
+        positions: polylinePositions,
+        width: 1.5,
+        material: Cesium.Color.WHITE.withAlpha(0.55)
+      }
+    });
+
+    const start = sampledCoords[0];
+    const end = sampledCoords[sampledCoords.length - 1];
+
+    routeEntities.add({
+      position: Cesium.Cartesian3.fromDegrees(start[1], start[0], 30000),
+      point: { pixelSize: 10, color: Cesium.Color.LIME },
+      label: {
+        text: 'START',
+        font: '12px monospace',
+        fillColor: Cesium.Color.LIME,
+        pixelOffset: new Cesium.Cartesian2(0, -18)
+      }
+    });
+
+    routeEntities.add({
+      position: Cesium.Cartesian3.fromDegrees(end[1], end[0], 30000),
+      point: { pixelSize: 10, color: Cesium.Color.ORANGE },
+      label: {
+        text: 'DEST',
+        font: '12px monospace',
+        fillColor: Cesium.Color.ORANGE,
+        pixelOffset: new Cesium.Cartesian2(0, -18)
+      }
+    });
+
     setGlobeIndiaStationaryView();
-    return;
+  } catch (error) {
+    handleGlobeFailure('route overlay render failed', error);
   }
-
-  const polylinePositions = latestRouteCoords.map(c => Cesium.Cartesian3.fromDegrees(c[1], c[0], 12000));
-
-  const arcDegrees = [];
-  const arcPeak = 90000;
-  const arcBase = 14000;
-  const maxIndex = Math.max(1, latestRouteCoords.length - 1);
-  for (let i = 0; i < latestRouteCoords.length; i++) {
-    const ratio = i / maxIndex;
-    const arcHeight = arcBase + Math.sin(ratio * Math.PI) * arcPeak;
-    arcDegrees.push(latestRouteCoords[i][1], latestRouteCoords[i][0], arcHeight);
-  }
-
-  routeEntities.add({
-    polyline: {
-      positions: Cesium.Cartesian3.fromDegreesArrayHeights(arcDegrees),
-      width: 4,
-      material: new Cesium.PolylineGlowMaterialProperty({
-        glowPower: 0.14,
-        taperPower: 0.5,
-        color: Cesium.Color.fromCssColorString('#52c7ff')
-      })
-    }
-  });
-
-  routeEntities.add({
-    polyline: {
-      positions: polylinePositions,
-      width: 1.5,
-      material: Cesium.Color.WHITE.withAlpha(0.55)
-    }
-  });
-
-  const start = latestRouteCoords[0];
-  const end = latestRouteCoords[latestRouteCoords.length - 1];
-
-  routeEntities.add({
-    position: Cesium.Cartesian3.fromDegrees(start[1], start[0], 30000),
-    point: { pixelSize: 10, color: Cesium.Color.LIME },
-    label: {
-      text: 'START',
-      font: '12px monospace',
-      fillColor: Cesium.Color.LIME,
-      pixelOffset: new Cesium.Cartesian2(0, -18)
-    }
-  });
-
-  routeEntities.add({
-    position: Cesium.Cartesian3.fromDegrees(end[1], end[0], 30000),
-    point: { pixelSize: 10, color: Cesium.Color.ORANGE },
-    label: {
-      text: 'DEST',
-      font: '12px monospace',
-      fillColor: Cesium.Color.ORANGE,
-      pixelOffset: new Cesium.Cartesian2(0, -18)
-    }
-  });
-
-  setGlobeIndiaStationaryView();
 }
 
 function getGlobeMeshLodParams(cameraHeightMeters) {
   if (cameraHeightMeters > 20000000) {
-    return { stride: 8, maxCells: 1200, detail: 'far' };
+    return { stride: 10, maxCells: 700, detail: 'far' };
   }
   if (cameraHeightMeters > 9000000) {
-    return { stride: 5, maxCells: 2200, detail: 'mid-far' };
+    return { stride: 7, maxCells: 1300, detail: 'mid-far' };
   }
   if (cameraHeightMeters > 3500000) {
-    return { stride: 3, maxCells: 3400, detail: 'mid' };
+    return { stride: 5, maxCells: 2000, detail: 'mid' };
   }
   if (cameraHeightMeters > 1400000) {
-    return { stride: 2, maxCells: 4800, detail: 'near' };
+    return { stride: 3, maxCells: 2800, detail: 'near' };
   }
-  return { stride: 1, maxCells: 7000, detail: 'close' };
+  return { stride: 2, maxCells: 3600, detail: 'close' };
 }
 
 function scheduleGlobeMeshRefresh(force = false) {
@@ -390,75 +589,87 @@ function scheduleGlobeMeshRefresh(force = false) {
       clearTimeout(globeMeshRefreshTimer);
       globeMeshRefreshTimer = null;
     }
-    renderGlobeHexMesh(true);
+    try {
+      renderGlobeHexMesh(true);
+    } catch (error) {
+      handleGlobeFailure('mesh refresh failed', error);
+    }
     return;
   }
 
   if (globeMeshRefreshTimer) return;
   globeMeshRefreshTimer = setTimeout(() => {
     globeMeshRefreshTimer = null;
-    renderGlobeHexMesh(false);
-  }, 140);
+    try {
+      renderGlobeHexMesh(false);
+    } catch (error) {
+      handleGlobeFailure('mesh refresh failed', error);
+    }
+  }, GLOBE_MESH_REFRESH_DEBOUNCE_MS);
 }
 
 function renderGlobeHexMesh(force = false) {
   if (!globeViewer || !globeMeshDataSource) return;
 
-  const meshEntities = globeMeshDataSource.entities;
-  if (!hexCells.length) {
+  try {
+    const meshEntities = globeMeshDataSource.entities;
+    if (!hexCells.length) {
+      meshEntities.removeAll();
+      globeMeshLodKey = '';
+      return;
+    }
+
+    const cameraHeight = globeViewer.camera.positionCartographic?.height || 5000000;
+    const lod = getGlobeMeshLodParams(cameraHeight);
+    const key = `${lod.stride}:${lod.maxCells}:${lod.detail}:${hexCells.length}:${activeHexRoute.length}`;
+    if (!force && key === globeMeshLodKey) return;
+    globeMeshLodKey = key;
+
     meshEntities.removeAll();
-    globeMeshLodKey = '';
-    return;
-  }
 
-  const cameraHeight = globeViewer.camera.positionCartographic?.height || 5000000;
-  const lod = getGlobeMeshLodParams(cameraHeight);
-  const key = `${lod.stride}:${lod.maxCells}:${lod.detail}:${hexCells.length}:${activeHexRoute.length}`;
-  if (!force && key === globeMeshLodKey) return;
-  globeMeshLodKey = key;
+    const onPath = new Set(activeHexRoute);
+    let rendered = 0;
 
-  meshEntities.removeAll();
-
-  const onPath = new Set(activeHexRoute);
-  let rendered = 0;
-
-  for (const cell of hexCells) {
-    const isRouteCell = onPath.has(cell.id);
-    if (!isRouteCell) {
-      const rank = Math.abs(cell.row) + Math.abs(cell.col);
-      if ((rank % lod.stride) !== 0) continue;
-    }
-    if (!isRouteCell && rendered >= lod.maxCells) continue;
-
-    const density = typeof cell.simulatedDensity === 'number' ? cell.simulatedDensity : cell.density;
-    const geoHeightMeters = typeof cell.geoHeightMeters === 'number'
-      ? cell.geoHeightMeters
-      : (HEX_GEO_HEIGHT_MIN_METERS + (density * (HEX_GEO_HEIGHT_MAX_METERS - HEX_GEO_HEIGHT_MIN_METERS)));
-    const fillRed = Math.round(120 + density * 120);
-    const fillGreen = Math.round(210 - density * 90);
-    const fillBlue = Math.round(240 - density * 160);
-    const fillAlpha = Math.round((isRouteCell ? 0.36 : (0.07 + density * 0.22)) * 255);
-    const lineAlpha = Math.round((isRouteCell ? 0.9 : (0.16 + density * 0.30)) * 255);
-
-    const vertices = buildHexVertices(cell.lat, cell.lon, currentHexEdgeMeters / 111320, currentHexEdgeMeters / (111320 * Math.max(0.2, Math.cos(cell.lat * Math.PI / 180))));
-    const lonLat = [];
-    for (const vertex of vertices) {
-      lonLat.push(vertex[1], vertex[0]);
-    }
-
-    meshEntities.add({
-      polygon: {
-        hierarchy: Cesium.Cartesian3.fromDegreesArray(lonLat),
-        height: isRouteCell ? HEX_GEO_HEIGHT_MAX_METERS : geoHeightMeters,
-        material: Cesium.Color.fromBytes(fillRed, fillGreen, fillBlue, fillAlpha),
-        outline: true,
-        outlineColor: isRouteCell
-          ? Cesium.Color.fromBytes(0, 0, 0, lineAlpha)
-          : Cesium.Color.fromBytes(255, 255, 255, lineAlpha)
+    for (const cell of hexCells) {
+      const isRouteCell = onPath.has(cell.id);
+      if (!isRouteCell) {
+        const rank = Math.abs(cell.row) + Math.abs(cell.col);
+        if ((rank % lod.stride) !== 0) continue;
       }
-    });
+      if (!isRouteCell && rendered >= lod.maxCells) continue;
 
-    rendered += 1;
+      const density = typeof cell.simulatedDensity === 'number' ? cell.simulatedDensity : cell.density;
+      const geoHeightMeters = typeof cell.geoHeightMeters === 'number'
+        ? cell.geoHeightMeters
+        : (HEX_GEO_HEIGHT_MIN_METERS + (density * (HEX_GEO_HEIGHT_MAX_METERS - HEX_GEO_HEIGHT_MIN_METERS)));
+      const fillRed = Math.round(120 + density * 120);
+      const fillGreen = Math.round(210 - density * 90);
+      const fillBlue = Math.round(240 - density * 160);
+      const fillAlpha = Math.round((isRouteCell ? 0.36 : (0.07 + density * 0.22)) * 255);
+      const lineAlpha = Math.round((isRouteCell ? 0.9 : (0.16 + density * 0.30)) * 255);
+
+      const vertices = buildHexVertices(cell.lat, cell.lon, currentHexEdgeMeters / 111320, currentHexEdgeMeters / (111320 * Math.max(0.2, Math.cos(cell.lat * Math.PI / 180))));
+      const lonLat = [];
+      for (const vertex of vertices) {
+        lonLat.push(vertex[1], vertex[0]);
+      }
+
+      meshEntities.add({
+        polygon: {
+          hierarchy: Cesium.Cartesian3.fromDegreesArray(lonLat),
+          height: isRouteCell ? HEX_GEO_HEIGHT_MAX_METERS : geoHeightMeters,
+          material: Cesium.Color.fromBytes(fillRed, fillGreen, fillBlue, fillAlpha),
+          outline: true,
+          outlineColor: isRouteCell
+            ? Cesium.Color.fromBytes(0, 0, 0, lineAlpha)
+            : Cesium.Color.fromBytes(255, 255, 255, lineAlpha)
+        }
+      });
+
+      rendered += 1;
+    }
+  } catch (error) {
+    handleGlobeFailure('mesh render failed', error);
   }
 }
 
@@ -472,23 +683,38 @@ function toggleGlobeMode() {
 
   if (globeMode) {
     if (typeof Cesium === 'undefined') {
-      globeMode = false;
-      showToast('3D globe library failed to load.', 'error');
+      handleGlobeFailure('library not loaded');
       return;
     }
 
-    initGlobeViewer();
-    mapDiv.style.display = 'none';
     globeDiv.style.display = 'block';
+    mapDiv.style.display = 'none';
     if (canvasArea) canvasArea.classList.add('globe-mode');
+
+    const viewerReady = initGlobeViewer();
+    if (!viewerReady || !globeViewer) {
+      handleGlobeFailure('viewer initialization failed');
+      return;
+    }
     if (globeBtn) globeBtn.textContent = '2D';
     globeAutoRotate = false;
     const rotateBtn = document.getElementById('rotate-btn');
     if (rotateBtn) rotateBtn.classList.remove('active');
     setStationaryGlobeControlState(true);
-    setGlobeIndiaStationaryView();
-    renderGlobeRoute();
-    scheduleGlobeMeshRefresh(true);
+
+    // Globe container was hidden in 2D mode; force Cesium to recalc viewport.
+    setTimeout(() => {
+      try {
+        if (!globeViewer) throw new Error('viewer missing after initialization');
+        globeViewer.resize();
+        setGlobeIndiaStationaryView();
+        renderGlobeRoute();
+        scheduleGlobeMeshRefresh(true);
+        globeViewer.scene.requestRender();
+      } catch (error) {
+        handleGlobeFailure('post-initialization render failed', error);
+      }
+    }, 0);
   } else {
     globeDiv.style.display = 'none';
     mapDiv.style.display = 'block';
@@ -497,6 +723,8 @@ function toggleGlobeMode() {
     setStationaryGlobeControlState(false);
     map.invalidateSize();
     resetView();
+    resetHexMeshViewportKey();
+    queueHexMeshRefresh('return-2d', { immediate: true, force: true });
   }
 }
 
@@ -509,8 +737,11 @@ function toggleGlobeRotate() {
 
 function toggleGlobeLighting() {
   if (!globeViewer) {
-    initGlobeViewer();
-    if (!globeViewer) return;
+    const ready = initGlobeViewer();
+    if (!ready || !globeViewer) {
+      handleGlobeFailure('lighting controller unavailable');
+      return;
+    }
   }
   globeNightMode = !globeNightMode;
   globeViewer.scene.globe.enableLighting = globeNightMode;
@@ -570,13 +801,29 @@ function fract(v) {
 function getHexSizeDegForZoom(zoom) {
   const centerLat = map ? map.getCenter().lat : 0;
 
-  // Core model concept: represent the globe as a hex partition where
-  // each hex edge is constrained to 50-100 meters.
-  const zoomAdaptive = HEX_EDGE_MAX_METERS - ((Math.max(2, Math.min(20, zoom)) - 2) * 2.5);
-  const baseMeters = Math.max(HEX_EDGE_MIN_METERS, Math.min(HEX_EDGE_MAX_METERS, zoomAdaptive));
+  // Keep world-zoom meshes coarse and gradually refine as user zooms in.
+  // This prevents generating millions of cells at low zoom levels.
+  let baseMeters;
+  if (zoom <= 2) baseMeters = 300000;
+  else if (zoom <= 3) baseMeters = 180000;
+  else if (zoom <= 4) baseMeters = 120000;
+  else if (zoom <= 5) baseMeters = 80000;
+  else if (zoom <= 6) baseMeters = 50000;
+  else if (zoom <= 7) baseMeters = 30000;
+  else if (zoom <= 8) baseMeters = 20000;
+  else if (zoom <= 9) baseMeters = 12000;
+  else if (zoom <= 10) baseMeters = 7000;
+  else if (zoom <= 11) baseMeters = 4000;
+  else if (zoom <= 12) baseMeters = 2400;
+  else if (zoom <= 13) baseMeters = 1400;
+  else if (zoom <= 14) baseMeters = 800;
+  else if (zoom <= 15) baseMeters = 450;
+  else if (zoom <= 16) baseMeters = 250;
+  else if (zoom <= 17) baseMeters = 140;
+  else baseMeters = 90;
 
-  // Higher refinement factor creates smaller cells.
-  const refinedMeters = Math.max(HEX_EDGE_MIN_METERS, Math.min(HEX_EDGE_MAX_METERS, baseMeters / meshResolutionFactor));
+  // Higher refinement factor creates smaller cells, but never below safety floor.
+  const refinedMeters = Math.max(HEX_EDGE_MIN_METERS, baseMeters / Math.max(0.6, meshResolutionFactor));
   currentHexEdgeMeters = refinedMeters;
 
   const metersPerDegreeLat = 111320;
@@ -604,7 +851,7 @@ function simulateHexCellMetrics(row, col, densityOverride) {
   return { density, geoHeightMeters };
 }
 
-async function fetchMeshDensities(cells, zoomLevel, edgeMeters) {
+async function fetchMeshDensitiesBatch(cells, zoomLevel, edgeMeters) {
   try {
     const res = await fetch(`${API}/mesh/density`, {
       method: 'POST',
@@ -632,6 +879,24 @@ async function fetchMeshDensities(cells, zoomLevel, edgeMeters) {
   }
 }
 
+async function fetchMeshDensities(cells, zoomLevel, edgeMeters) {
+  if (!Array.isArray(cells) || !cells.length) return new Map();
+
+  if (cells.length <= HEX_DENSITY_FETCH_BATCH) {
+    return fetchMeshDensitiesBatch(cells, zoomLevel, edgeMeters);
+  }
+
+  const merged = new Map();
+  for (let i = 0; i < cells.length; i += HEX_DENSITY_FETCH_BATCH) {
+    const chunk = cells.slice(i, i + HEX_DENSITY_FETCH_BATCH);
+    const part = await fetchMeshDensitiesBatch(chunk, zoomLevel, edgeMeters);
+    if (!part) continue;
+    for (const [key, value] of part.entries()) merged.set(key, value);
+  }
+
+  return merged.size ? merged : null;
+}
+
 function buildHexVertices(centerLat, centerLon, radiusLat, radiusLon) {
   const vertices = [];
   for (let i = 0; i < 6; i++) {
@@ -651,8 +916,16 @@ function getNeighborDeltas(isOddRow) {
   return [[0, -1], [0, 1], [-1, -1], [-1, 0], [1, -1], [1, 0]];
 }
 
-async function refreshHexMesh() {
+async function refreshHexMesh(options = {}) {
   if (!map || !hexLayer) return;
+
+  const force = Boolean(options.force);
+  const zoom = map.getZoom();
+  const b = map.getBounds();
+  const viewportKey = getHexMeshViewportKey(b, zoom);
+
+  if (!force && viewportKey === meshViewportKey) return;
+  meshViewportKey = viewportKey;
 
   const renderToken = ++meshRenderVersion;
   hexLayer.clearLayers();
@@ -663,31 +936,34 @@ async function refreshHexMesh() {
     globeMeshLodKey = '';
   }
 
-  const zoom = map.getZoom();
-  const b = map.getBounds();
-  const centerLat = map.getCenter().lat;
-
   const size = getHexSizeDegForZoom(zoom);
   const radiusLat = size.radiusLat;
   const radiusLon = size.radiusLon;
 
   const stepX = Math.sqrt(3) * radiusLon;
   const stepY = 1.5 * radiusLat;
+  const latPadding = radiusLat * 1.25;
+  const lonPadding = radiusLon * 1.25;
 
-  // Row/column indices are world-space hex coordinates, so this is a
-  // viewport window over one global hex mesh partition.
-  const rowStart = Math.floor((b.getSouth() - (3 * radiusLat)) / stepY);
-  const rowEnd = Math.ceil((b.getNorth() + (3 * radiusLat)) / stepY);
+  // Build only for visible viewport plus a thin ring to avoid edge pop-in.
+  const rowStart = Math.floor((b.getSouth() - latPadding) / stepY);
+  const rowEnd = Math.ceil((b.getNorth() + latPadding) / stepY);
+
+  const rowCount = Math.max(1, rowEnd - rowStart + 1);
+  const approxColCount = Math.max(1, Math.ceil(((b.getEast() - b.getWest()) + (2 * lonPadding)) / stepX));
+  const estimatedCells = rowCount * approxColCount;
+  const budget = globeMode ? HEX_CELL_BUDGET_3D : HEX_CELL_BUDGET_2D;
+  const stride = Math.max(1, Math.ceil(Math.sqrt(estimatedCells / budget)));
 
   const skeletonCells = [];
 
-  for (let row = rowStart; row <= rowEnd; row++) {
+  for (let row = rowStart; row <= rowEnd; row += stride) {
     const centerY = row * stepY;
     const offsetX = (row & 1) ? (stepX / 2) : 0;
-    const colStart = Math.floor((b.getWest() - (3 * radiusLon) - offsetX) / stepX);
-    const colEnd = Math.ceil((b.getEast() + (3 * radiusLon) - offsetX) / stepX);
+    const colStart = Math.floor((b.getWest() - lonPadding - offsetX) / stepX);
+    const colEnd = Math.ceil((b.getEast() + lonPadding - offsetX) / stepX);
 
-    for (let col = colStart; col <= colEnd; col++) {
+    for (let col = colStart; col <= colEnd; col += stride) {
       const centerX = col * stepX + offsetX;
       const id = `${row}:${col}`;
       skeletonCells.push({
@@ -700,6 +976,11 @@ async function refreshHexMesh() {
     }
   }
 
+  if (!skeletonCells.length) {
+    scheduleGlobeMeshRefresh(true);
+    return;
+  }
+
   const densityMap = await fetchMeshDensities(
     skeletonCells.map(c => ({ row: c.row, col: c.col })),
     zoom,
@@ -707,7 +988,15 @@ async function refreshHexMesh() {
   );
   if (renderToken !== meshRenderVersion) return;
 
-    for (const c of skeletonCells) {
+  const clickEnabled = skeletonCells.length <= 2600;
+  const chunkSize = getHexRenderChunkSize();
+
+  for (let i = 0; i < skeletonCells.length; i += chunkSize) {
+    if (renderToken !== meshRenderVersion) return;
+
+    const end = Math.min(i + chunkSize, skeletonCells.length);
+    for (let j = i; j < end; j++) {
+      const c = skeletonCells[j];
       const simulated = simulateHexCellMetrics(c.row, c.col, densityMap ? densityMap.get(c.id) : undefined);
       const density = simulated.density;
       const lineOpacity = 0.08 + (density * 0.24);
@@ -716,17 +1005,22 @@ async function refreshHexMesh() {
       const fillGreen = Math.round(210 - density * 90);
       const fillBlue = Math.round(240 - density * 160);
 
-      const polygon = L.polygon(buildHexVertices(c.lat, c.lon, radiusLat, radiusLon), {
+      const polygonOpts = {
         color: `rgba(255,255,255,${lineOpacity.toFixed(3)})`,
         weight: 1,
         fillColor: `rgb(${fillRed},${fillGreen},${fillBlue})`,
         fillOpacity: fillOpacity
-      }).addTo(hexLayer);
+      };
+      if (hexCanvasRenderer) polygonOpts.renderer = hexCanvasRenderer;
 
-      polygon.on('click', () => {
-        const trafficPercent = Math.round(density * 100);
-        showToast(`Hex density: ${trafficPercent}% | height: ${Math.round(simulated.geoHeightMeters)}m`, 'info');
-      });
+      const polygon = L.polygon(buildHexVertices(c.lat, c.lon, radiusLat, radiusLon), polygonOpts).addTo(hexLayer);
+
+      if (clickEnabled) {
+        polygon.on('click', () => {
+          const trafficPercent = Math.round(density * 100);
+          showToast(`Hex density: ${trafficPercent}% | height: ${Math.round(simulated.geoHeightMeters)}m`, 'info');
+        });
+      }
 
       const cell = {
         id: c.id,
@@ -743,6 +1037,11 @@ async function refreshHexMesh() {
 
       hexCells.push(cell);
       hexCellById.set(c.id, cell);
+    }
+
+    if (end < skeletonCells.length) {
+      await nextFrame();
+    }
   }
 
   for (const cell of hexCells) {
@@ -761,8 +1060,12 @@ function setHexResolution(rawValue) {
   const pct = Number(rawValue);
   meshResolutionFactor = Math.max(0.6, Math.min(1.8, pct / 100));
   const val = document.getElementById('mesh-refine-val');
-  if (val) val.textContent = `${currentHexEdgeMeters.toFixed(0)}m`;
-  refreshHexMesh();
+  if (val) {
+    const preview = getHexSizeDegForZoom(map ? map.getZoom() : 2).edgeMeters;
+    val.textContent = `${preview.toFixed(0)}m`;
+  }
+  resetHexMeshViewportKey();
+  queueHexMeshRefresh('refinement-slider', { force: true });
 }
 
 function setHexRefinement(rawValue) {
@@ -786,7 +1089,8 @@ async function applySyntheticDesignControls() {
     }
 
     await persistMeshConfig();
-    await refreshHexMesh();
+    resetHexMeshViewportKey();
+    await refreshHexMesh({ force: true, reason: 'design-controls' });
     showToast('Synthetic design controls applied', 'success');
   } catch (e) {
     showToast(`Failed to apply design controls: ${e.message}`, 'error');
@@ -996,65 +1300,61 @@ function highlightHexRoute(pathIds) {
   scheduleGlobeMeshRefresh(true);
 }
 
-function hashText32(text) {
-  let h = 2166136261;
-  for (let i = 0; i < text.length; i++) {
-    h ^= text.charCodeAt(i);
-    h = Math.imul(h, 16777619);
+function hashTextToUnit(text) {
+  let hash = 2166136261;
+  const str = String(text || '');
+  for (let i = 0; i < str.length; i++) {
+    hash ^= str.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
   }
-  return h >>> 0;
+  return (hash >>> 0) / 4294967295;
 }
 
-function toTitleCase(value) {
-  return value
-    .split(/\s+/)
-    .filter(Boolean)
-    .map(s => s.charAt(0).toUpperCase() + s.slice(1))
-    .join(' ');
-}
-
-function createSyntheticLocation(query) {
-  const q = query.trim();
-  if (!q) return null;
-
-  const demo = getDemoGraph();
-  const lower = q.toLowerCase();
-
-  let match = demo.nodes.find(n => n.id.toLowerCase() === lower);
-  if (!match) {
-    match = demo.nodes.find(n => n.name.toLowerCase() === lower);
-  }
-  if (!match) {
-    match = demo.nodes.find(n => n.name.toLowerCase().includes(lower) || lower.includes(n.name.toLowerCase()));
-  }
-
-  if (match) {
-    return {
-      lat: match.lat,
-      lon: match.lon,
-      label: match.name,
-      raw: { synthetic: false, matchedNode: match.id, query: q }
-    };
-  }
-
-  const h1 = hashText32(lower + ':lat');
-  const h2 = hashText32(lower + ':lon');
-
-  const lat = -55 + ((h1 % 13000) / 100);
-  const lon = -170 + ((h2 % 34000) / 100);
-
+function syntheticGeocodeFallback(query) {
+  const lat = -45 + (hashTextToUnit(`${query}|lat`) * 90);
+  const lon = -170 + (hashTextToUnit(`${query}|lon`) * 340);
   return {
     lat,
     lon,
-    label: `${toTitleCase(q)} (Synthetic)` ,
-    raw: { synthetic: true, query: q }
+    name: query,
+    label: `${query} (synthetic)`,
+    display_name: `${query} (synthetic fallback)`
   };
 }
 
 async function geocodeLocation(query) {
-  const loc = createSyntheticLocation(query);
-  if (!loc) throw new Error(`Could not resolve location: ${query}`);
-  return loc;
+  const q = String(query || '').trim();
+  if (!q) throw new Error('Please provide a valid location');
+
+  try {
+    const url = `${NOMINATIM_API}/search?format=jsonv2&limit=1&q=${encodeURIComponent(q)}`;
+    const res = await fetch(url, {
+      headers: {
+        'Accept': 'application/json'
+      }
+    });
+
+    if (!res.ok) {
+      return syntheticGeocodeFallback(q);
+    }
+
+    const matches = await res.json();
+    if (!Array.isArray(matches) || !matches.length) {
+      return syntheticGeocodeFallback(q);
+    }
+
+    const best = matches[0];
+    return {
+      lat: Number(best.lat),
+      lon: Number(best.lon),
+      name: best.name || q,
+      label: best.display_name ? best.display_name.split(',')[0] : q,
+      display_name: best.display_name || q,
+      raw: best
+    };
+  } catch (_) {
+    return syntheticGeocodeFallback(q);
+  }
 }
 
 function drawHexRoute(srcGeo, dstGeo, routeResult) {
@@ -1126,207 +1426,6 @@ function renderHexRouteResult(srcGeo, dstGeo, routeResult, algo) {
 }
 
 
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-// GRAPH LOADING
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-// Removed loadGraph since we use dynamic OSRM routing
-
-function getDemoGraph() {
-  const nodes = [
-    {id:"NYC",name:"New York",lat:40.7128,lon:-74.0060,blocked:false},
-    {id:"LAX",name:"Los Angeles",lat:34.0522,lon:-118.2437,blocked:false},
-    {id:"CHI",name:"Chicago",lat:41.8781,lon:-87.6298,blocked:false},
-    {id:"MEX",name:"Mexico City",lat:19.4326,lon:-99.1332,blocked:false},
-    {id:"YYZ",name:"Toronto",lat:43.6510,lon:-79.3470,blocked:false},
-    {id:"LON",name:"London",lat:51.5074,lon:-0.1278,blocked:false},
-    {id:"PAR",name:"Paris",lat:48.8566,lon:2.3522,blocked:false},
-    {id:"BER",name:"Berlin",lat:52.5200,lon:13.4050,blocked:false},
-    {id:"MAD",name:"Madrid",lat:40.4168,lon:-3.7038,blocked:false},
-    {id:"ROM",name:"Rome",lat:41.9028,lon:12.4964,blocked:false},
-    {id:"MOW",name:"Moscow",lat:55.7558,lon:37.6173,blocked:false},
-    {id:"CAI",name:"Cairo",lat:30.0444,lon:31.2357,blocked:false},
-    {id:"JNB",name:"Johannesburg",lat:-26.2041,lon:28.0473,blocked:false},
-    {id:"CPT",name:"Cape Town",lat:-33.9249,lon:18.4241,blocked:false},
-    {id:"DXB",name:"Dubai",lat:25.2048,lon:55.2708,blocked:false},
-    {id:"MUM",name:"Mumbai",lat:19.0760,lon:72.8777,blocked:false},
-    {id:"DEL",name:"Delhi",lat:28.6139,lon:77.2090,blocked:false},
-    {id:"PEK",name:"Beijing",lat:39.9042,lon:116.4074,blocked:false},
-    {id:"SHA",name:"Shanghai",lat:31.2304,lon:121.4737,blocked:false},
-    {id:"TYO",name:"Tokyo",lat:35.6762,lon:139.6503,blocked:false},
-    {id:"SEO",name:"Seoul",lat:37.5665,lon:126.9780,blocked:false},
-    {id:"SIN",name:"Singapore",lat:1.3521,lon:103.8198,blocked:false},
-    {id:"BKK",name:"Bangkok",lat:13.7563,lon:100.5018,blocked:false},
-    {id:"SYD",name:"Sydney",lat:-33.8688,lon:151.2093,blocked:false},
-    {id:"MEL",name:"Melbourne",lat:-37.8136,lon:144.9631,blocked:false},
-    {id:"GIG",name:"Rio de Janeiro",lat:-22.9068,lon:-43.1729,blocked:false},
-    {id:"GRU",name:"Sao Paulo",lat:-23.5505,lon:-46.6333,blocked:false},
-    {id:"EZE",name:"Buenos Aires",lat:-34.6037,lon:-58.3816,blocked:false},
-    {id:"BOG",name:"Bogota",lat:4.7110,lon:-74.0721,blocked:false},
-    {id:"LIM",name:"Lima",lat:-12.0464,lon:-77.0428,blocked:false}
-  ];
-  const edgeDefs = [
-    ["NYC","CHI",1140],["NYC","YYZ",790],["CHI","LAX",3240],["LAX","MEX",2500],
-    ["NYC","MEX",3360],["MEX","BOG",3160],["BOG","LIM",1880],["LIM","EZE",3140],
-    ["BOG","GRU",4320],["GRU","GIG",430],["GRU","EZE",1700],["LON","PAR",344],
-    ["PAR","MAD",1050],["PAR","BER",1050],["PAR","ROM",1420],["BER","ROM",1500],
-    ["BER","MOW",1600],["LON","BER",930],["MAD","CAI",3350],["ROM","CAI",2130],
-    ["CAI","DXB",2400],["CAI","JNB",6300],["JNB","CPT",1400],["DXB","MUM",1930],
-    ["MOW","DEL",4340],["DXB","DEL",2200],["MUM","DEL",1400],["DEL","BKK",2900],
-    ["BKK","SIN",1830],["SIN","SHA",3800],["DEL","PEK",3780],["PEK","SHA",1200],
-    ["PEK","SEO",950],["SEO","TYO",1150],["SHA","TYO",1760],["SIN","SYD",6300],
-    ["SYD","MEL",870],["NYC","LON",5570],["LAX","TYO",8800],["GIG","CPT",6050],
-    ["MOW","PEK",5800],["YYZ","LON",5700],["EZE","CPT",6800]
-  ];
-  const edges = [];
-  edgeDefs.forEach(([f,t,w]) => {
-    edges.push({from:f, to:t, base_weight:w, weight:w, traffic_multiplier:1.0, road_name:"", blocked:false});
-    edges.push({from:t, to:f, base_weight:w, weight:w, traffic_multiplier:1.0, road_name:"", blocked:false});
-  });
-  return {nodes, edges};
-}
-
-// Removed getDemoGraph and populateSelects
-
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-// MAP RENDER LOGIC
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-function computeNodePositions() {
-  updateMapLayer();
-}
-
-function updateMapLayer() {
-  if (!graphData || !map) return;
-  
-  for (let e of edgeLines) map.removeLayer(e);
-  for (let id in nodeMarkers) map.removeLayer(nodeMarkers[id]);
-  edgeLines = [];
-  nodeMarkers = {};
-  bounds = L.latLngBounds();
-
-  const drawnEdges = new Set();
-  graphData.edges.forEach(edge => {
-    const key = [edge.from, edge.to].sort().join('-');
-    if (drawnEdges.has(key)) return;
-    drawnEdges.add(key);
-
-    const n1 = graphData.nodes.find(n => n.id === edge.from);
-    const n2 = graphData.nodes.find(n => n.id === edge.to);
-    if (!n1 || !n2) return;
-
-    const isPathEdge = isEdgeOnPath(edge.from, edge.to);
-    const isBlocked = edge.blocked;
-    const hasTraffic = edge.traffic_multiplier > 1.2;
-
-    let color = '#232b38';
-    let weight = 2;
-    let dashArray = '';
-    let opacity = 0.9;
-
-    if (isBlocked) {
-      color = '#ff4560'; weight = 3; dashArray = '6, 6';
-    } else if (isPathEdge) {
-      color = '#000000'; weight = 6; opacity = 1.0;
-    } else if (hasTraffic) {
-      color = '#ffd166'; weight = 3; opacity = 0.5 + (edge.traffic_multiplier - 1) * 0.2;
-    }
-
-    // Outline glow for path
-    if (isPathEdge) {
-      edgeLines.push(L.polyline([[n1.lat, n1.lon], [n2.lat, n2.lon]], {
-        color: '#ffffff', weight: 10, opacity: 0.4
-      }).addTo(map));
-    }
-
-    const line = L.polyline([[n1.lat, n1.lon], [n2.lat, n2.lon]], {
-      color, weight, dashArray, opacity
-    }).addTo(map);
-
-    if (isPathEdge) {
-      const midLat = (n1.lat + n2.lat) / 2;
-      const midLon = (n1.lon + n2.lon) / 2;
-      const icon = L.divIcon({
-        className: 'edge-label',
-        html: `<div style="background:rgba(0,0,0,0.85);color:#ffffff;font-family:'IBM Plex Mono';font-size:10px;padding:2px 6px;border-radius:4px;width:max-content;border:1px solid rgba(255,255,255,0.3)">${edge.base_weight}</div>`,
-        iconSize: [0, 0],
-        iconAnchor: [10, 10]
-      });
-      edgeLines.push(L.marker([midLat, midLon], {icon}).addTo(map));
-    }
-
-    edgeLines.push(line);
-  });
-
-  graphData.nodes.forEach(node => {
-    bounds.extend([node.lat, node.lon]);
-    const isOnPath = currentPath.includes(node.id);
-    const isVisited = visitedNodes.includes(node.id);
-    const isSrc = currentPath[0] === node.id;
-    const isDst = currentPath[currentPath.length-1] === node.id;
-    const isBlocked = node.blocked;
-
-    let fillColor = '#161b24', color = '#232b38';
-    if (isBlocked) { fillColor = '#1a0a0e'; color = '#ff4560'; }
-    else if (isSrc) { fillColor = 'rgba(124,244,160,0.4)'; color = '#7cf4a0'; }
-    else if (isDst) { fillColor = 'rgba(255,107,53,0.4)'; color = '#ff6b35'; }
-    else if (isOnPath) { fillColor = 'rgba(0,0,0,0.85)'; color = '#000000'; }
-    else if (isVisited) { fillColor = 'rgba(179,136,255,0.4)'; color = 'rgba(179,136,255,1)'; }
-
-    const marker = L.circleMarker([node.lat, node.lon], {
-      radius: isOnPath ? 7 : 5,
-      fillColor: fillColor,
-      color: color,
-      weight: isOnPath ? 3 : 2,
-      fillOpacity: 1,
-      opacity: 1
-    }).addTo(map);
-
-    marker.bindTooltip(`<b>${node.id}</b><br><span style="color:#6b7a90;font-size:10px">${node.name}</span>`, {
-      permanent: true,
-      direction: 'right',
-      className: 'leaflet-custom-tooltip',
-      offset: [10, 0]
-    });
-
-    marker.on('click', () => {
-      const srcInput = document.getElementById('src-select');
-      const dstInput = document.getElementById('dst-select');
-      if (!srcInput.value) {
-        srcInput.value = node.id;
-        showToast(`Selected ${node.name} as Source`, 'success');
-      } else if (!dstInput.value) {
-        dstInput.value = node.id;
-        showToast(`Selected ${node.name} as Destination`, 'success');
-      } else {
-        showNodeInfo(node);
-      }
-    });
-    nodeMarkers[node.id] = marker;
-  });
-}
-
-function isEdgeOnPath(a, b) {
-  for (let i = 0; i < currentPath.length - 1; i++) {
-    if ((currentPath[i] === a && currentPath[i+1] === b) ||
-        (currentPath[i] === b && currentPath[i+1] === a)) return true;
-  }
-  return false;
-}
-
-function showNodeInfo(node) {
-  const edges = graphData.edges.filter(e => e.from === node.id || e.to === node.id);
-  const unique = [...new Map(edges.map(e => {
-    const key = [e.from, e.to].sort().join('-');
-    return [key, e];
-  })).values()];
-  const connections = unique.map(e => {
-    const other = e.from === node.id ? e.to : e.from;
-    const n = graphData.nodes.find(x=>x.id===other);
-    return `${n?.name||other} (${e.base_weight}km)`;
-  }).join(', ');
-  showToast(`ðŸ“ ${node.name}
-Connections: ${connections.substring(0,80)}`, 'info');
-}
-
 function zoomIn() {
   if (globeMode && globeViewer) {
     showToast('Zoom is disabled in stationary globe mode.', 'info');
@@ -1365,10 +1464,10 @@ function toggleAnimation() {
 // ROUTE FINDING
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 const ALGO_DESCRIPTIONS = {
-  dijkstra: 'Dijkstra = weighted shortest path on hex traffic mesh',
-  astar:    'A* Star = heuristic-guided weighted search on hex mesh',
-  bfs:      'BFT = breadth-first hex traversal with low-density expansion preference',
-  dfs:      'DFT = depth-first hex traversal with low-density expansion preference'
+  dijkstra: 'Weighted shortest path on the hex-density traffic mesh (best for optimal traffic-aware route).',
+  astar:    'Heuristic-guided weighted search on the same hex-density mesh (often faster than Dijkstra).',
+  bfs:      'Breadth-first traversal over hex cells with density-aware neighbor ordering.',
+  dfs:      'Depth-first traversal over hex cells with density-aware neighbor ordering.'
 };
 
 function setAlgo(algo) {
@@ -1383,11 +1482,26 @@ function setAlgo(algo) {
   const desc = document.getElementById('algo-desc');
   if (desc) desc.textContent = ALGO_DESCRIPTIONS[algo] || '';
   const findText = document.getElementById('find-btn-text');
-  if (findText) {
-    if (algo === 'bfs') findText.textContent = 'ðŸ” RUN BFT ON HEX MESH';
-    else if (algo === 'dfs') findText.textContent = 'ðŸ” RUN DFT ON HEX MESH';
-    else findText.textContent = 'âš¡ FIND HEX TRAFFIC PATH';
+  if (findText) findText.textContent = 'FIND PATH';
+}
+
+async function ensureMeshAroundEndpoints(srcGeo, dstGeo, reason = 'route') {
+  if (!map) return;
+
+  const routeBounds = L.latLngBounds([
+    [Number(srcGeo.lat), Number(srcGeo.lon)],
+    [Number(dstGeo.lat), Number(dstGeo.lon)]
+  ]);
+
+  if (routeBounds.isValid()) {
+    map.fitBounds(routeBounds.pad(0.45), {
+      padding: [60, 60],
+      animate: false,
+      maxZoom: 9
+    });
   }
+
+  await refreshHexMesh({ force: true, reason });
 }
 
 async function findRoute() {
@@ -1395,32 +1509,45 @@ async function findRoute() {
   const dst = document.getElementById('dst-select').value.trim();
   if (!src || !dst) { showToast('Please enter both locations', 'error'); return; }
 
-  setLoading('find-btn', 'find-btn-text', true, 'ROUTING ON HEX MESH\u2026');
+  setLoading('find-btn', 'find-btn-text', true, 'SEARCHING HEX-DENSITY ROUTE...');
 
   try {
-    if (!hexCells.length) refreshHexMesh();
+    highlightHexRoute([]);
 
     const [srcGeo, dstGeo] = await Promise.all([
       geocodeLocation(src),
       geocodeLocation(dst)
     ]);
 
+    await ensureMeshAroundEndpoints(srcGeo, dstGeo, 'route-find');
+
     const srcCell = findNearestHexCell(srcGeo.lat, srcGeo.lon);
     const dstCell = findNearestHexCell(dstGeo.lat, dstGeo.lon);
-    if (!srcCell || !dstCell) throw new Error('Unable to map locations into hex mesh. Try zooming out once.');
+
+    if (!srcCell || !dstCell) {
+      throw new Error('Could not map locations into the current hex-density mesh.');
+    }
+    if (srcCell.id === dstCell.id) {
+      throw new Error('Both locations map to the same hex cell. Try more distant inputs.');
+    }
 
     const routeResult = runHexPathSearch(srcCell, dstCell, selectedAlgo);
-    if (!routeResult.found) throw new Error('No mesh route found. Try a different zoom level or traffic setting.');
+    renderHexRouteResult(srcGeo, dstGeo, routeResult, selectedAlgo);
+
+    if (!routeResult.found) {
+      showToast('No density-aware path found between these points.', 'warn');
+      return;
+    }
 
     highlightHexRoute(routeResult.pathIds);
     drawHexRoute(srcGeo, dstGeo, routeResult);
-    renderHexRouteResult(srcGeo, dstGeo, routeResult, selectedAlgo);
+
+    showToast(`${(selectedAlgo || 'route').toUpperCase()} route computed on hex-density mesh.`, 'success');
 
   } catch(e) {
     document.getElementById('route-result').innerHTML = `<div class="result-card error"><div class="badge badge-danger">ERROR</div><p style="margin-top:10px;font-size:13px;color:var(--muted)">${e.message}</p></div>`;
   } finally {
-    const label = selectedAlgo === 'bfs' ? '\ud83d\udd0d RUN BFT ON HEX MESH' : selectedAlgo === 'dfs' ? '\ud83d\udd0d RUN DFT ON HEX MESH' : '\u26a1 FIND HEX TRAFFIC PATH';
-    setLoading('find-btn', 'find-btn-text', false, label);
+    setLoading('find-btn', 'find-btn-text', false, 'FIND PATH');
   }
 }
 
@@ -1436,127 +1563,6 @@ function haversineDist(lat1, lon1, lat2, lon2) {
 
 // Legacy traversal methods were replaced by unified hex-density routing.
 
-
-function drawRealRoute(srcP, dstP, route, fallback) {
-  for (let e of edgeLines) map.removeLayer(e);
-  for (let id in nodeMarkers) map.removeLayer(nodeMarkers[id]);
-  edgeLines = []; nodeMarkers = {}; bounds = L.latLngBounds();
-  
-  // Clear graphData to prevent updateMapLayer from redrawing all cities
-  graphData = null;
-  
-  const sc = [parseFloat(srcP.lat), parseFloat(srcP.lon)];
-  const dc = [parseFloat(dstP.lat), parseFloat(dstP.lon)];
-
-  if (!fallback && route) {
-    // Build coords â€” always prepend source & append destination so path
-    // visually connects from the user's chosen source all the way to destination.
-    let coords = route.geometry.coordinates.map(c => [c[1], c[0]]);
-    coords.unshift(sc);   // ensure path starts exactly at source
-    coords.push(dc);      // ensure path ends exactly at destination
-
-    // White halo for contrast on light-coloured map tiles
-    const halo = L.polyline(coords, { color: '#ffffff', weight: 11, opacity: 0.55 }).addTo(map);
-    edgeLines.push(halo);
-    // Bold black path on top
-    const line = L.polyline(coords, { color: '#000000', weight: 6, opacity: 1.0 }).addTo(map);
-    edgeLines.push(line);
-
-    // Extend bounds to include every point on the route PLUS both endpoints
-    coords.forEach(c => bounds.extend(c));
-    bounds.extend(sc);
-    bounds.extend(dc);
-    
-    const dist = (route.distance / 1000).toFixed(1);
-    const mins = (route.duration / 60).toFixed(1);
-    
-    document.getElementById('route-result').innerHTML = `<div class="result-card success">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-        <span class="badge badge-success">ðŸŒ GLOBAL ROUTING (OSRM)</span>
-      </div>
-      <div class="stat-grid">
-        <div class="stat"><div class="stat-label">Driving Dist</div><div class="stat-value">${dist}<span class="stat-unit"> km</span></div></div>
-        <div class="stat"><div class="stat-label">Est. Time</div><div class="stat-value">${mins}<span class="stat-unit"> min</span></div></div>
-      </div>
-      <p style="font-size:12px;color:var(--muted);margin-top:8px;">${srcP.name || srcP.display_name.split(',')[0]} â†’ ${dstP.name || dstP.display_name.split(',')[0]}</p>
-    </div>`;
-  } else {
-    // No driving route â€” draw a flight path with dotted line source â†’ destination
-    bounds.extend(sc);
-    bounds.extend(dc);
-
-    // Flight path styling: blue dotted line with glow effect
-    const halo = L.polyline([sc, dc], { color: '#4dabf7', weight: 8, opacity: 0.3, dashArray: '12, 10' }).addTo(map);
-    edgeLines.push(halo);
-    // Main flight path: blue with larger dash pattern for flight appearance
-    const line = L.polyline([sc, dc], { color: '#228be6', weight: 4, dashArray: '15, 12', opacity: 0.95, lineCap: 'round' }).addTo(map);
-    edgeLines.push(line);
-
-    // Add flight path arrow markers in the middle
-    const midLat = (sc[0] + dc[0]) / 2;
-    const midLon = (sc[1] + dc[1]) / 2;
-    const flightIcon = L.divIcon({
-      className: 'flight-marker',
-      html: `<div style="font-size:14px;filter:drop-shadow(0 1px 2px rgba(0,0,0,0.3));">âœˆï¸</div>`,
-      iconSize: [20, 20],
-      iconAnchor: [10, 10]
-    });
-    edgeLines.push(L.marker([midLat, midLon], { icon: flightIcon, interactive: false }).addTo(map));
-
-    document.getElementById('route-result').innerHTML = `<div class="result-card warn" style="border-color:var(--warn)">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-        <span class="badge badge-warn" style="color:var(--warn)">âœˆï¸ DIRECT FLIGHT PATH</span>
-      </div>
-      <p style="font-size:12px;color:var(--muted);margin-bottom:8px;">No driving route found between these locations. Showing direct flight path with dotted line.</p>
-    </div>`;
-  }
-
-  const sM = L.circleMarker(sc, { radius: 7, fillColor: 'rgba(124,244,160,0.8)', color: '#7cf4a0', weight: 2, fillOpacity: 1 }).addTo(map);
-  sM.bindTooltip(`<b>Source</b><br>${srcP.name || srcP.display_name.split(',')[0]}`, {direction: 'top'}).openTooltip();
-  nodeMarkers['src'] = sM;
-
-  const dM = L.circleMarker(dc, { radius: 7, fillColor: 'rgba(255,107,53,0.8)', color: '#ff6b35', weight: 2, fillOpacity: 1 }).addTo(map);
-  dM.bindTooltip(`<b>Dest</b><br>${dstP.name || dstP.display_name.split(',')[0]}`, {direction: 'top'}).openTooltip();
-  nodeMarkers['dst'] = dM;
-
-  map.fitBounds(bounds, {padding: [50, 50]});
-}
-
-function renderRouteResult(r) {
-  const el = document.getElementById('route-result');
-  if (!r.found) {
-    el.innerHTML = `<div class="result-card error">
-      <div class="badge badge-danger">NO PATH FOUND</div>
-      <p style="margin-top:10px;font-size:13px;color:var(--muted)">No traversable path between these nodes. Check for road blocks.</p>
-    </div>`;
-    return;
-  }
-  const pathHtml = r.path.map((n, i) => {
-    const cls = i === 0 ? 'src' : (i === r.path.length-1 ? 'dst' : '');
-    const node = graphData?.nodes.find(x=>x.id===n);
-    return `${i>0?'<span class="path-arrow">â†’</span>':''}<span class="path-node ${cls}">${node?.name||n}</span>`;
-  }).join('');
-
-  el.innerHTML = `<div class="result-card success">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-      <span class="badge badge-success">${r.algorithm} Â· PATH FOUND</span>
-      <span style="font-size:11px;color:var(--muted);font-family:var(--font-mono)">${r.computation_ms?.toFixed(3)||'â€”'}ms</span>
-    </div>
-    <div class="stat-grid">
-      <div class="stat"><div class="stat-label">Distance</div><div class="stat-value">${r.total_distance}<span class="stat-unit"> km</span></div></div>
-      <div class="stat"><div class="stat-label">Est. Time</div><div class="stat-value">${Math.round(r.total_time_min||0)}<span class="stat-unit"> min</span></div></div>
-      <div class="stat"><div class="stat-label">Nodes Visited</div><div class="stat-value">${r.visited_count||r.visited_order?.length||0}</div></div>
-      <div class="stat"><div class="stat-label">Hops</div><div class="stat-value">${r.path.length - 1}</div></div>
-    </div>
-    <div class="path-display">
-      <div class="section-title" style="margin-bottom:8px">Shortest Path</div>
-      <div class="path-nodes">${pathHtml}</div>
-    </div>
-    <div class="section-title">Visited Order (${r.visited_order?.length||0} nodes)</div>
-    <div class="visited-list">${(r.visited_order||[]).map(n=>{const nd=graphData?.nodes.find(x=>x.id===n);return nd?.name||n}).join(' â†’ ')}</div>
-  </div>`;
-}
-
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // COMPARE
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
@@ -1571,12 +1577,12 @@ async function compareAlgos() {
     `<div class="empty-state"><div class="empty-state-icon pulse">âš™ï¸</div><div class="empty-state-text">Creating synthetic routing designâ€¦</div></div>`;
 
   try {
-    if (!hexCells.length) refreshHexMesh();
-
     const [srcGeo, dstGeo] = await Promise.all([
       geocodeLocation(src),
       geocodeLocation(dst)
     ]);
+
+    await ensureMeshAroundEndpoints(srcGeo, dstGeo, 'compare');
 
     const srcCell = findNearestHexCell(srcGeo.lat, srcGeo.lon);
     const dstCell = findNearestHexCell(dstGeo.lat, dstGeo.lon);
@@ -1611,7 +1617,7 @@ async function compareAlgos() {
       { key: 'dfs',      label: 'DFT',       color: '#ffd166',        note: 'Depth-first with density ordering' },
     ];
 
-    const bestVisited = Math.min(...algos.map(a => cmpData[a.key]?.visited_count || Infinity));
+    const bestVisited = Math.min(...algos.map(a => cmpData[a.key]?.visitedCount ?? Infinity));
 
     const cols = algos.map(a => {
       const d = cmpData[a.key] || {};
@@ -1646,7 +1652,7 @@ async function compareAlgos() {
   }
 }
 
-let multiRealRoutes = [];
+let multiHexRoutes = [];
 
 async function findMultiRoute() {
   const src = document.getElementById('multi-src').value.trim();
@@ -1658,12 +1664,12 @@ async function findMultiRoute() {
     `<div class="empty-state"><div class="empty-state-icon pulse">ðŸ”</div><div class="empty-state-text">Searching alternative routesâ€¦</div></div>`;
 
   try {
-    if (!hexCells.length) refreshHexMesh();
-
     const [srcGeo, dstGeo] = await Promise.all([
       geocodeLocation(src),
       geocodeLocation(dst)
     ]);
+
+    await ensureMeshAroundEndpoints(srcGeo, dstGeo, 'multi-route');
 
     const srcCell = findNearestHexCell(srcGeo.lat, srcGeo.lon);
     const dstCell = findNearestHexCell(dstGeo.lat, dstGeo.lon);
@@ -1707,10 +1713,10 @@ async function findMultiRoute() {
     }
 
     if (!routes.length) throw new Error('No synthetic alternatives found.');
-    multiRealRoutes = routes;
+    multiHexRoutes = routes;
 
     selectedMultiRouteIdx = 0;
-    renderMultiRoutesOSRM();
+    renderMultiRoutes();
   } catch(e) {
     document.getElementById('multi-result').innerHTML =
       `<div class="result-card error"><div class="badge badge-danger">ERROR</div><p style="margin-top:10px;font-size:12px;color:var(--muted)">${e.message}</p></div>`;
@@ -1723,7 +1729,7 @@ function drawAllMultiRoutes() {
   for (let id in nodeMarkers) map.removeLayer(nodeMarkers[id]);
   edgeLines = []; nodeMarkers = {}; bounds = L.latLngBounds();
 
-  multiRealRoutes.forEach((r, i) => {
+  multiHexRoutes.forEach((r, i) => {
     const isSelected = i === selectedMultiRouteIdx;
     const coords = [[r.srcGeo.lat, r.srcGeo.lon]];
     for (const id of r.pathIds) {
@@ -1744,8 +1750,8 @@ function drawAllMultiRoutes() {
   });
 
   // Source & destination markers (from selected route)
-  if (multiRealRoutes.length > 0) {
-    const sel = multiRealRoutes[selectedMultiRouteIdx];
+  if (multiHexRoutes.length > 0) {
+    const sel = multiHexRoutes[selectedMultiRouteIdx];
     const srcCoord = [sel.srcGeo.lat, sel.srcGeo.lon];
     const dstCoord = [sel.dstGeo.lat, sel.dstGeo.lon];
     bounds.extend(srcCoord); bounds.extend(dstCoord);
@@ -1763,12 +1769,12 @@ function drawAllMultiRoutes() {
   if (globeMode) renderGlobeRoute();
 }
 
-function renderMultiRoutesOSRM() {
-  const html = multiRealRoutes.map((r, i) => {
+function renderMultiRoutes() {
+  const html = multiHexRoutes.map((r, i) => {
     const isSelected = i === selectedMultiRouteIdx;
     const distLabel  = `${r.dist} km`;
     const timeLabel  = `â± ${r.time} min Â· ${r.algo.toUpperCase()}`;
-    return `<div class="route-option ${isSelected ? 'selected' : ''}" onclick="selectMultiRouteOSRM(${i})">
+    return `<div class="route-option ${isSelected ? 'selected' : ''}" onclick="selectMultiRoute(${i})">
       <div class="route-option-header">
         <span class="route-rank">${r.label}</span>
         <span class="route-dist">${distLabel}</span>
@@ -1786,9 +1792,9 @@ function renderMultiRoutesOSRM() {
   drawAllMultiRoutes();
 }
 
-function selectMultiRouteOSRM(idx) {
+function selectMultiRoute(idx) {
   selectedMultiRouteIdx = idx;
-  renderMultiRoutesOSRM();
+  renderMultiRoutes();
 }
 
 
@@ -1836,9 +1842,8 @@ async function simulateTraffic() {
     if (val) val.textContent = `${Math.round(meshTrafficIntensity * 100)}%`;
     syncSyntheticControlFields();
 
-    await refreshHexMesh();
-    graphData = data.graph; // Update local graph data
-    updateMapLayer();
+    resetHexMeshViewportKey();
+    await refreshHexMesh({ force: true, reason: 'traffic-simulate' });
     showToast('ðŸš¦ Traffic simulation applied with persisted mesh density profile', 'success');
   } catch(e) {
     showToast(`Traffic simulation failed: ${e.message}`, 'error');
@@ -1858,10 +1863,6 @@ async function blockRoad() {
     const data = await res.json();
     if (data.error) throw new Error(data.error);
     
-    // Refresh graph from server to reflect block
-    const gRes = await fetch(`${API}/graph`);
-    graphData = await gRes.json();
-    updateMapLayer();
     showToast(`ðŸš§ Road ${from} <-> ${to} blocked`, 'warn');
   } catch(e) {
     showToast(`Block failed: ${e.message}`, 'error');
@@ -1900,12 +1901,8 @@ async function resetConditions() {
     }
     syncSyntheticControlFields();
 
-    await refreshHexMesh();
-
-    // Refresh graph
-    const gRes = await fetch(`${API}/graph`);
-    graphData = await gRes.json();
-    updateMapLayer();
+    resetHexMeshViewportKey();
+    await refreshHexMesh({ force: true, reason: 'traffic-reset' });
     showToast('â†º Network conditions reset to normal', 'success');
   } catch(e) { showToast('Reset failed', 'error'); }
 }
